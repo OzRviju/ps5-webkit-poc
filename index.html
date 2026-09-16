@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PS5 WebKit PoC Suite</title>
+<style>
+body { background: #0a0a0a; color: #e0e0e0; font-family: system-ui, sans-serif; padding: 20px; max-width: 700px; margin: 0 auto; }
+h1 { color: #00ff88; font-size: 1.4em; }
+a { color: #00ccff; text-decoration: none; display: block; padding: 16px; margin: 8px 0;
+    border: 1px solid #333; border-radius: 8px; background: #1a1a1a; font-size: 1.1em; }
+a:active { background: #333; }
+.desc { color: #888; font-size: 0.85em; margin-top: 4px; }
+.priority { color: #ff4444; font-weight: bold; font-size: 0.75em; }
+</style>
+</head>
+<body>
+<h1>🎯 PS5 WebKit PoC Suite</h1>
+<p style="color:#888;">Apri uno dei fuzzer e monitora klog per crash (SIGSEGV/SIGBUS).</p>
+
+<a href="mse-fuzzer.html">
+    ▶ MSE SourceBuffer Fuzzer
+    <span class="priority">★ PRIORITÀ #1</span>
+    <div class="desc">Genera MP4/WebM malformati → demuxer Sony (PSSourceBufferBackend::append)</div>
+</a>
+
+<a href="css-html-fuzzer.html">
+    ▶ HTML/CSS/SVG Parser Fuzzer
+    <div class="desc">DOM fuzzato con attributi estremi, SVG malformati, deep nesting</div>
+</a>
+
+<a href="ax-enum-ub.html">
+    ▶ Accessibility IPC PoC
+    <div class="desc">Flooding mutazioni AX → IPC enum senza validazione range (UIProcess UB)</div>
+</a>
+
+<a href="multipart-fuzzer.html">
+    ▶ Multipart Parser Fuzzer
+    <div class="desc">Richiede multipart-server.py sul tuo PC. Testa CurlMultipartHandle.</div>
+</a>
+</body>
+</html>
