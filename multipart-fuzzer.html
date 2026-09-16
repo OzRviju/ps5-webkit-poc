@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Multipart x-mixed-replace Fuzzer — PS5 WebKit</title>
+<style>
+body { background: #111; color: #0f0; font-family: monospace; padding: 20px; }
+#log { white-space: pre-wrap; max-height: 70vh; overflow-y: auto; font-size: 12px; }
+.crash { color: #f00; font-weight: bold; }
+.info  { color: #0ff; }
+.mut   { color: #ff0; }
+button { margin: 4px; padding: 8px 16px; }
+</style>
+</head>
+<body>
+<h2>Multipart x-mixed-replace Fuzzer</h2>
+<p class="info">
+Target: CurlMultipartHandle::findBoundary() / parseHeadersIfPossible()<br>
+Modified by Sony (Feb 2025). Parses attacker-controlled boundary strings.<br>
+Uses a local python server to serve malformed multipart responses.
+</p>
+<div>
+  <button onclick="startFuzz()">Start Fuzzing</button>
+  <button onclick="stopFuzz()">Stop</button>
+</div>
+<div>Iterations: <span id="count">0</span></div>
+<div id="log"></div>
+
+<p class="info" style="margin-top:20px; border-top:1px solid #333; padding-top:10px;">
+<b>HOW TO USE:</b><br>
+1. Start the Python server on your PC (or PS5 if possible):<br>
+<code>python multipart-server.py</code><br>
+2. Open this page on PS5 pointing to your server<br>
+3. Or use the inline fetch-based fuzzer below (limited by CORS)<br>
+<br>
+<b>The Python server generates malformed multipart responses with:</b><br>
+- Boundary strings with special chars / extreme length<br>
+- Truncated parts mid-header<br>
+- Missing CRLF terminators<br>
+- Close delimiter without final CRLF<br>
+- Overlapping boundaries<br>
+- Headers exceeding 300KB limit<br>
+</p>
+
+<img id="target" style="display:none;">
+
+<script>
+"use strict";
+const logEl = document.getElementById('log');
+const countEl = document.getElementById('count');
+let running = false;
+let iteration = 0;
+
+function log(msg, cls) {
+    const line = document.createElement('div');
+    line.className = cls || '';
+    line.textContent = `[${iteration}] ${msg}`;
+    logEl.appendChild(line);
+    if (logEl.children.length > 500) logEl.removeChild(logEl.firstChild);
+    logEl.scrollTop = logEl.scrollHeight;
+}
+
+// In-browser multipart test via <img> tags
+// The PS5 browser's CurlMultipartHandle processes multipart/x-mixed-replace
+// responses for <img> elements (used for MJPEG streams etc.)
+
+// We can't fully control multipart from JS alone,
+// but we CAN trigger the parser with malformed img sources
+// pointing to the Python server.
+
+const SERVER = 'http://YOUR_PC_IP:8888'; // Change this!
+
+async function fuzzIteration() {
+    return new Promise((resolve) => {
+        const timer = setTimeout(() => {
+            log('Timeout — possible hang in multipart parser!', 'crash');
+            resolve('timeout');
+        }, 3000);
+
+        const img = document.createElement('img');
+
+        img.onload = () => {
+            clearTimeout(timer);
+            resolve('loaded');
+        };
+
+        img.onerror = () => {
+            clearTimeout(timer);
+            resolve('error');
+        };
+
+        // Each request gets a different fuzzed multipart response from the server
+        img.src = `${SERVER}/fuzz?iter=${iteration}&rand=${Math.random()}`;
+
+        // Also try as an EventSource (uses multipart too)
+        // const es = new EventSource(`${SERVER}/fuzz?iter=${iteration}`);
+        // setTimeout(() => es.close(), 2000);
+    });
+}
+
+async function startFuzz() {
+    if (running) return;
+    running = true;
+    iteration = 0;
+    logEl.innerHTML = '';
+
+    if (SERVER.includes('YOUR_PC_IP')) {
+        log('⚠ Edit SERVER variable in this file to point to your PC running multipart-server.py', 'crash');
+        log('Then reload this page on PS5', 'info');
+        running = false;
+        return;
+    }
+
+    log('Starting multipart fuzzer — watch klog for crashes', 'info');
+
+    while (running) {
+        iteration++;
+        countEl.textContent = iteration;
+        await fuzzIteration();
+        if (iteration % 50 === 0) log(`── ${iteration} iterations ──`, 'info');
+        await new Promise(r => setTimeout(r, 100));
+    }
+}
+
+function stopFuzz() {
+    running = false;
+    log('Stopped.', 'info');
+}
+</script>
+</body>
+</html>

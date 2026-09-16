@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>CSS/HTML Parser Fuzzer — PS5 WebKit</title>
+<style>
+body { background: #111; color: #0f0; font-family: monospace; padding: 20px; }
+#log { white-space: pre-wrap; max-height: 70vh; overflow-y: auto; font-size: 12px; }
+.crash { color: #f00; font-weight: bold; }
+.info  { color: #0ff; }
+.mut   { color: #ff0; }
+button { margin: 4px; padding: 8px 16px; }
+</style>
+</head>
+<body>
+<h2>CSS/HTML/SVG Parser Fuzzer</h2>
+<p class="info">Target: WebCore HTML/CSS/SVG parsing + layout engine (WebProcess memory corruption)</p>
+<div>
+  <button onclick="startFuzz('html')">Fuzz HTML</button>
+  <button onclick="startFuzz('css')">Fuzz CSS</button>
+  <button onclick="startFuzz('svg')">Fuzz SVG</button>
+  <button onclick="startFuzz('mixed')">Fuzz Mixed</button>
+  <button onclick="stopFuzz()">STOP</button>
+</div>
+<div>Iterations: <span id="count">0</span> | Crashes: <span id="crashes">0</span></div>
+<div id="log"></div>
+<!-- Hidden iframe where we inject fuzzed content -->
+<iframe id="target" style="width:1px;height:1px;opacity:0;position:absolute;" sandbox="allow-same-origin"></iframe>
+
+<script>
+"use strict";
+const logEl = document.getElementById('log');
+const countEl = document.getElementById('count');
+const crashesEl = document.getElementById('crashes');
+const targetFrame = document.getElementById('target');
+
+let running = false;
+let iteration = 0;
+let crashCount = 0;
+
+function log(msg, cls) {
+    const line = document.createElement('div');
+    line.className = cls || '';
+    line.textContent = `[${iteration}] ${msg}`;
+    logEl.appendChild(line);
+    if (logEl.children.length > 500) logEl.removeChild(logEl.firstChild);
+    logEl.scrollTop = logEl.scrollHeight;
+}
+
+function rnd(n) { return Math.floor(Math.random() * n); }
+function pick(arr) { return arr[rnd(arr.length)]; }
+function rndStr(len) {
+    const c = 'abcdefghijklmnopqrstuvwxyz0123456789-_';
+    let s = '';
+    for (let i = 0; i < len; i++) s += c[rnd(c.length)];
+    return s;
+}
+
+// ========= HTML GENERATORS =========
+const TAGS = ['div','span','table','tr','td','th','select','option','textarea','input',
+    'form','a','img','video','audio','source','canvas','svg','math','details',
+    'summary','template','slot','dialog','marquee','frameset','frame','iframe',
+    'object','embed','ruby','rt','rp','bdi','bdo','wbr','col','colgroup',
+    'caption','thead','tbody','tfoot','pre','code','meter','progress','output',
+    'fieldset','legend','datalist','optgroup','button','label','map','area','picture'];
+
+const ATTRS = ['id','class','style','title','tabindex','contenteditable','draggable',
+    'hidden','dir','lang','accesskey','autofocus','role','aria-label','aria-hidden',
+    'data-x','name','value','type','src','href','action','method','target',
+    'width','height','cols','rows','colspan','rowspan','span','wrap','pattern',
+    'min','max','step','multiple','selected','checked','disabled','readonly',
+    'required','placeholder','list','form','formaction','formmethod','formtarget',
+    'sandbox','srcdoc','loading','decoding','referrerpolicy','crossorigin',
+    'integrity','nonce','is','slot','part','exportparts','xmlns','xml:lang'];
+
+const CSS_PROPS = ['display','position','float','clear','overflow','clip',
+    'width','height','min-width','max-width','min-height','max-height',
+    'margin','padding','border','outline','background','color','font',
+    'text-align','text-decoration','text-transform','text-indent','text-shadow',
+    'line-height','letter-spacing','word-spacing','white-space','word-break',
+    'vertical-align','list-style','table-layout','border-collapse','border-spacing',
+    'caption-side','empty-cells','cursor','z-index','opacity','visibility',
+    'transform','transition','animation','filter','mix-blend-mode',
+    'grid-template-columns','grid-template-rows','grid-column','grid-row',
+    'flex','flex-direction','flex-wrap','justify-content','align-items',
+    'column-count','column-width','column-gap','column-rule','columns',
+    'contain','content-visibility','aspect-ratio','container-type',
+    'writing-mode','direction','unicode-bidi','text-orientation',
+    'object-fit','object-position','resize','scroll-behavior',
+    '-webkit-line-clamp','-webkit-text-fill-color','-webkit-text-stroke',
+    '-webkit-mask','-webkit-appearance','-webkit-overflow-scrolling',
+    'backdrop-filter','clip-path','shape-outside','isolation'];
+
+const CSS_VALUES = ['inherit','initial','unset','revert','none','auto','0','1px',
+    '-1px','100%','50vw','50vh','calc(100% - 10px)','calc(-1 * 100%)','999999px',
+    '-999999px','0.001em','1e10px','NaN','Infinity','-Infinity',
+    'rgb(0,0,0)','rgba(255,255,255,0.5)','hsl(0,100%,50%)','transparent',
+    'currentColor','url(data:image/svg+xml,<svg/>)','url(#x)',
+    'block','inline','inline-block','flex','grid','table','contents','flow-root',
+    'absolute','fixed','sticky','relative','static',
+    'left','right','both','none','hidden','scroll','visible','clip',
+    'rotate(360deg)','scale(0)','scale(-1)','skew(90deg)','matrix(1,0,0,1,0,0)',
+    'translate3d(0,0,0)','perspective(1px)','rotate3d(1,1,1,45deg)',
+    'blur(100px)','brightness(0)','contrast(1000%)','saturate(0)','invert(100%)',
+    'polygon(0 0, 100% 0, 100% 100%)','circle(50%)','ellipse(50% 50%)',
+    'repeat(auto-fill, minmax(0, 1fr))','subgrid','masonry'];
+
+function genAttrValue() {
+    const r = Math.random();
+    if (r < 0.1) return `${'A'.repeat(rnd(8192))}`;
+    if (r < 0.2) return `${rnd(0xFFFFFFFF)}`;
+    if (r < 0.3) return `javascript:void(0)`;
+    if (r < 0.4) return `data:text/html,<b>x</b>`;
+    if (r < 0.5) return '';
+    return rndStr(rnd(64));
+}
+
+function genCSS(depth) {
+    let css = '';
+    const nRules = rnd(10) + 1;
+    for (let i = 0; i < nRules; i++) {
+        const sel = pick(['*','div','div > div','.x','#x',':nth-child('+rnd(100)+')',
+            '::before','::after','::first-line','::first-letter','::marker',
+            ':has(div)',':not(:empty)',':where(div)',':is(span,div)',
+            'div:nth-of-type('+rnd(100)+'n+'+rnd(100)+')',':root']);
+        css += `${sel} {\n`;
+        const nProps = rnd(6) + 1;
+        for (let j = 0; j < nProps; j++) {
+            css += `  ${pick(CSS_PROPS)}: ${pick(CSS_VALUES)};\n`;
+        }
+        css += '}\n';
+    }
+    return css;
+}
+
+function genHTML(depth) {
+    if (depth > 5 || Math.random() < 0.1) return rndStr(rnd(20));
+    let html = '';
+    const nChildren = rnd(4) + 1;
+    for (let i = 0; i < nChildren; i++) {
+        const tag = pick(TAGS);
+        html += `<${tag}`;
+        const nAttrs = rnd(4);
+        for (let j = 0; j < nAttrs; j++) {
+            html += ` ${pick(ATTRS)}="${genAttrValue()}"`;
+        }
+        // Self-closing sometimes
+        if (Math.random() < 0.2 || ['img','input','br','hr','col','wbr','area','embed','source'].includes(tag)) {
+            html += '/>';
+        } else {
+            html += `>${genHTML(depth+1)}</${tag}>`;
+        }
+    }
+    return html;
+}
+
+function genSVG() {
+    const shapes = ['rect','circle','ellipse','line','polyline','polygon','path','text','use',
+        'clipPath','mask','filter','feGaussianBlur','feColorMatrix','feTurbulence',
+        'linearGradient','radialGradient','pattern','symbol','marker','foreignObject',
+        'animate','animateTransform','animateMotion','set'];
+    let svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${rnd(10000)}" height="${rnd(10000)}" viewBox="0 0 ${rnd(0xFFFF)} ${rnd(0xFFFF)}">`;
+    const n = rnd(10) + 1;
+    for (let i = 0; i < n; i++) {
+        const shape = pick(shapes);
+        svg += `<${shape} `;
+        const nAttrs = rnd(6);
+        for (let j = 0; j < nAttrs; j++) {
+            svg += ` ${pick(['x','y','cx','cy','r','rx','ry','x1','y1','x2','y2',
+                'width','height','d','points','transform','fill','stroke',
+                'stroke-width','opacity','clip-path','filter','mask',
+                'font-size','textLength','lengthAdjust',
+                'viewBox','preserveAspectRatio','patternUnits','gradientUnits',
+                'stdDeviation','values','type','in','in2','result',
+                'begin','dur','repeatCount','from','to','by','keyTimes','keySplines',
+                'href','xlink:href'])}="${genAttrValue()}"`;
+        }
+        svg += `>${rndStr(rnd(10))}</${shape}>`;
+    }
+    svg += '</svg>';
+    return svg;
+}
+
+function genFuzzedPage(mode) {
+    let content = '<!DOCTYPE html><html><head><style>';
+    content += genCSS();
+    content += '</style></head><body>';
+
+    if (mode === 'html' || mode === 'mixed') content += genHTML(0);
+    if (mode === 'svg' || mode === 'mixed') content += genSVG();
+    if (mode === 'css') {
+        // CSS-heavy: lots of elements + heavy style
+        content += '<style>' + genCSS() + '</style>';
+        content += '<style>' + genCSS() + '</style>';
+        for (let i = 0; i < 20; i++) content += `<div class="x" id="x${i}" style="${pick(CSS_PROPS)}:${pick(CSS_VALUES)}">${rndStr(5)}</div>`;
+    }
+
+    content += '</body></html>';
+    return content;
+}
+
+async function fuzzIteration(mode) {
+    return new Promise((resolve) => {
+        const timer = setTimeout(() => {
+            log('Timeout/hang', 'mut');
+            resolve('timeout');
+        }, 4000);
+
+        try {
+            const html = genFuzzedPage(mode);
+            const blob = new Blob([html], { type: 'text/html' });
+            const url = URL.createObjectURL(blob);
+
+            targetFrame.onload = () => {
+                clearTimeout(timer);
+                try {
+                    // Force layout
+                    const doc = targetFrame.contentDocument;
+                    if (doc && doc.body) {
+                        doc.body.offsetHeight; // force reflow
+                        // Trigger additional layout paths
+                        if (doc.body.firstElementChild) {
+                            doc.body.firstElementChild.getBoundingClientRect();
+                            doc.body.firstElementChild.scrollIntoView();
+                        }
+                    }
+                } catch(e) {
+                    // Security error from sandbox — fine
+                }
+                URL.revokeObjectURL(url);
+                resolve('ok');
+            };
+
+            targetFrame.onerror = () => {
+                clearTimeout(timer);
+                URL.revokeObjectURL(url);
+                resolve('error');
+            };
+
+            targetFrame.src = url;
+
+        } catch(e) {
+            clearTimeout(timer);
+            log(`CRASH: ${e.name}: ${e.message}`, 'crash');
+            crashCount++;
+            crashesEl.textContent = crashCount;
+            resolve('crash');
+        }
+    });
+}
+
+async function startFuzz(mode) {
+    if (running) return;
+    running = true;
+    iteration = 0;
+    crashCount = 0;
+    logEl.innerHTML = '';
+    log(`Starting ${mode} fuzzer. Watch klog for SIGSEGV!`, 'info');
+
+    while (running) {
+        iteration++;
+        countEl.textContent = iteration;
+        await fuzzIteration(mode);
+        if (iteration % 200 === 0)
+            log(`── ${iteration} iterations done ──`, 'info');
+        await new Promise(r => setTimeout(r, 30));
+    }
+}
+
+function stopFuzz() {
+    running = false;
+    log('Stopped.', 'info');
+}
+
+window.onerror = function(msg, src, line, col) {
+    crashCount++;
+    crashesEl.textContent = crashCount;
+    log(`GLOBAL ERROR: ${msg} @${line}:${col}`, 'crash');
+};
+</script>
+</body>
+</html>

