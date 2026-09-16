@@ -173,6 +173,59 @@ surfaces via `canvas::IndirectCanvas::setIndirectCompositingSource()`.
 
 **Severity:** Medium (requires WebProcess compromise first)
 
+### VULN-006: JSC Config Freezing Disabled in Production
+
+**File:** `Source/JavaScriptCore/runtime/VM.cpp:395-398`
+```cpp
+#if PLATFORM(PLAYSTATION)
+    // FIXME: <PLAYSTATION> REMOVE disableFreezingForTesting() call after RNPS no longer needs this behavior
+    Config::disableFreezingForTesting();
+#endif
+```
+
+**Description:** PlayStation WebKit disables JSC's Config freezing — a security
+hardening that makes `g_jscConfig` read-only after initialization. This is
+explicitly a testing function (`disableFreezingForTesting`) used in production.
+With writable config, an attacker who has an arbitrary write primitive can
+modify JIT configuration, disable security features (caging, randomization),
+or change execution settings. This significantly lowers the exploitation bar
+for any initial memory corruption vulnerability.
+
+**Severity:** Medium (security mitigation bypass — not a bug itself, but weakens defense)
+
+### VULN-007: LLInt PC Range Check Disabled
+
+**File:** `Source/JavaScriptCore/llint/LLIntPCRanges.h:46-48`
+```cpp
+#if PLATFORM(PLAYSTATION)
+    UNUSED_PARAM(pc);
+    return false;  // Always false — skips CFI check
+#else
+    // Normal: checks if PC is within LLInt code range
+```
+
+**Description:** The `isLLIntPC()` function, used for control flow integrity
+verification, always returns `false` on PlayStation. This disables runtime
+checks that verify program counters point to valid interpreter code,
+making ROP (Return-Oriented Programming) attacks easier.
+
+**Severity:** Low-Medium (security mitigation bypass)
+
+### VULN-008: Reduced StructureID Heap (128MB vs 4GB)
+
+**File:** `Source/JavaScriptCore/runtime/StructureID.h:50-51`
+```cpp
+#elif PLATFORM(PLAYSTATION)
+constexpr uintptr_t structureHeapAddressSize = 128 * MB;
+```
+
+**Description:** PlayStation uses a 128MB StructureID heap vs 4GB on desktop.
+StructureIDs are JSC's type tags used to prevent type confusion. A smaller
+heap means fewer possible StructureID values, making prediction/collision
+attacks more feasible in certain exploit scenarios.
+
+**Severity:** Low (hardening reduction)
+
 ## Testing Setup
 
 ### Requirements
