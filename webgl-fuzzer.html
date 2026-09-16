@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WebGL Fuzzer - PS5 WebKit</title>
+<style>
+body { background: #0a0a0a; color: #e0e0e0; font-family: system-ui, sans-serif; padding: 20px; max-width: 700px; margin: 0 auto; }
+h1 { color: #9900ff; font-size: 1.3em; }
+button { background: #9900ff; color: #fff; border: none; padding: 14px 20px; border-radius: 6px; font-size: 1em; margin: 6px 4px; cursor: pointer; }
+button:active { background: #7700cc; }
+button.stop { background: #cc0000; }
+canvas { display: none; }
+#log { background: #111; padding: 12px; border-radius: 6px; font-family: monospace; font-size: 0.85em; max-height: 50vh; overflow-y: auto; white-space: pre-wrap; word-break: break-all; margin-top: 10px; }
+.err { color: #ff4444; }
+.ok { color: #00ff88; }
+.info { color: #888; }
+.warn { color: #ffaa00; }
+#stats { color: #00ccff; font-size: 0.9em; margin: 8px 0; }
+</style>
+</head>
+<body>
+<h1>WebGL Fuzzer</h1>
+<p style="color:#888;">Targets: GPU driver / GraphicsContextGL via malformed textures, shaders, framebuffers.<br>
+Focus: integer overflows in readPixels/texImage2D size calculations, OOB in shader compilation.</p>
+
+<div>
+<button onclick="startFuzz('texture')">Fuzz Textures</button>
+<button onclick="startFuzz('shader')">Fuzz Shaders</button>
+<button onclick="startFuzz('framebuffer')">Fuzz FBOs</button>
+<button onclick="startFuzz('all')">Fuzz All</button>
+<button class="stop" onclick="stopFuzz()">Stop</button>
+</div>
+<div id="stats">Iterations: 0 | GL Errors: 0 | Crashes: 0</div>
+<div id="log"></div>
+<canvas id="c" width="64" height="64"></canvas>
+
+<script>
+const log = document.getElementById('log');
+const statsEl = document.getElementById('stats');
+let running = false;
+let iterations = 0;
+let glErrors = 0;
+let crashes = 0;
+
+function addLog(msg, cls) {
+    const line = document.createElement('div');
+    line.className = cls || '';
+    line.textContent = `[${iterations}] ${msg}`;
+    log.appendChild(line);
+    if (log.children.length > 500) log.removeChild(log.firstChild);
+    log.scrollTop = log.scrollHeight;
+}
+
+function updateStats() {
+    statsEl.textContent = `Iterations: ${iterations} | GL Errors: ${glErrors} | Crashes: ${crashes}`;
+}
+
+function randInt(min, max) { return min + Math.floor(Math.random() * (max - min)); }
+
+function getGL() {
+    const canvas = document.getElementById('c');
+    let gl = canvas.getContext('webgl2') || canvas.getContext('webgl');
+    if (!gl) {
+        addLog('WebGL not available!', 'err');
+        return null;
+    }
+    return gl;
+}
+
+function drainErrors(gl) {
+    let count = 0;
+    while (gl.getError() !== gl.NO_ERROR) count++;
+    if (count) glErrors += count;
+    return count;
+}
+
+// Texture fuzzing strategies
+function fuzzTexture(gl) {
+    const strategies = [
+        'huge_dimensions',
+        'zero_dimensions',
+        'mismatch_format',
+        'negative_level',
+        'extreme_level',
+        'null_data_large',
+        'tiny_buffer',
+        'compressed_garbage',
+        'cubemap_incomplete',
+        'readpixels_oob',
+    ];
+    const strategy = strategies[randInt(0, strategies.length)];
+
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+
+    switch (strategy) {
+        case 'huge_dimensions': {
+            // Try to trigger integer overflow in width*height*bpp
+            const w = randInt(16384, 65536);
+            const h = randInt(16384, 65536);
+            addLog(`texImage2D ${w}x${h} RGBA`, 'info');
+            try { gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null); } catch(e) { addLog(`Exception: ${e.message}`, 'err'); }
+            break;
+        }
+        case 'zero_dimensions': {
+            addLog('texImage2D 0x0', 'info');
+            try { gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, null); } catch(e) { addLog(`Exception: ${e.message}`, 'err'); }
+            break;
+        }
+        case 'mismatch_format': {
+            // Internal format doesn't match data format
+            const formats = [gl.RGBA, gl.RGB, gl.LUMINANCE, gl.ALPHA, gl.LUMINANCE_ALPHA];
+            const types = [gl.UNSIGNED_BYTE, gl.UNSIGNED_SHORT_5_6_5, gl.UNSIGNED_SHORT_4_4_4_4, gl.UNSIGNED_SHORT_5_5_5_1];
+            const internalFormat = formats[randInt(0, formats.length)];
+            const format = formats[randInt(0, formats.length)];
+            const type = types[randInt(0, types.length)];
+            const data = new Uint8Array(randInt(1, 256));
+            addLog(`texImage2D format mismatch: ${internalFormat}/${format}/${type}`, 'info');
+            try { gl.texImage2D(gl.TEXTURE_2D, 0, internalFormat, 4, 4, 0, format, type, data); } catch(e) { addLog(`Exception: ${e.message}`, 'err'); }
+            break;
+        }
+        case 'negative_level': {
+            addLog('texImage2D level=-1', 'info');
+            try { gl.texImage2D(gl.TEXTURE_2D, -1, gl.RGBA, 4, 4, 0, gl.RGBA, gl.UNSIGNED_BYTE, null); } catch(e) { addLog(`Exception: ${e.message}`, 'err'); }
+            break;
+        }
+        case 'extreme_level': {
+            const level = randInt(100, 65536);
+            addLog(`texImage2D level=${level}`, 'info');
+            try { gl.texImage2D(gl.TEXTURE_2D, level, gl.RGBA, 4, 4, 0, gl.RGBA, gl.UNSIGNED_BYTE, null); } catch(e) { addLog(`Exception: ${e.message}`, 'err'); }
+            break;
+        }
+        case 'null_data_large': {
+            // Large null allocation
+            const s = randInt(4096, 16384);
+            addLog(`texImage2D ${s}x${s} null data`, 'info');
+            try { gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, s, s, 0, gl.RGBA, gl.UNSIGNED_BYTE, null); } catch(e) { addLog(`Exception: ${e.message}`, 'err'); }
+            break;
+        }
+        case 'tiny_buffer': {
+            // Data buffer too small for stated dimensions
+            const data = new Uint8Array(4); // only 1 pixel
+            addLog('texImage2D 256x256 with 4-byte buffer', 'info');
+            try { gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 256, 256, 0, gl.RGBA, gl.UNSIGNED_BYTE, data); } catch(e) { addLog(`Exception: ${e.message}`, 'err'); }
+            break;
+        }
+        case 'compressed_garbage': {
+            if (gl.getExtension) {
+                const ext = gl.getExtension('WEBGL_compressed_texture_s3tc') ||
+                           gl.getExtension('WEBGL_compressed_texture_etc') ||
+                           gl.getExtension('WEBGL_compressed_texture_astc');
+                if (ext) {
+                    const garbage = new Uint8Array(randInt(1, 4096));
+                    crypto.getRandomValues(garbage);
+                    // Use a known compressed format constant
+                    const format = 0x83F0; // COMPRESSED_RGB_S3TC_DXT1_EXT
+                    addLog(`compressedTexImage2D garbage ${garbage.length}B`, 'info');
+                    try { gl.compressedTexImage2D(gl.TEXTURE_2D, 0, format, 64, 64, 0, garbage); } catch(e) { addLog(`Exception: ${e.message}`, 'err'); }
+                } else {
+                    addLog('No compressed texture extension', 'info');
+                }
+            }
+            break;
+        }
+        case 'cubemap_incomplete': {
+            gl.bindTexture(gl.TEXTURE_CUBE_MAP, tex);
+            // Only fill some faces, leave others incomplete
+            const faces = [gl.TEXTURE_CUBE_MAP_POSITIVE_X, gl.TEXTURE_CUBE_MAP_NEGATIVE_X,
+                          gl.TEXTURE_CUBE_MAP_POSITIVE_Y, gl.TEXTURE_CUBE_MAP_NEGATIVE_Y,
+                          gl.TEXTURE_CUBE_MAP_POSITIVE_Z, gl.TEXTURE_CUBE_MAP_NEGATIVE_Z];
+            const numFaces = randInt(1, 5);
+            for (let i = 0; i < numFaces; i++) {
+                const s = randInt(1, 64);
+                gl.texImage2D(faces[i], 0, gl.RGBA, s, s, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+            }
+            addLog(`Incomplete cubemap: ${numFaces}/6 faces`, 'info');
+            // Try to use it
+            const fb = gl.createFramebuffer();
+            gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+            gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, faces[0], tex, 0);
+            gl.drawArrays(gl.TRIANGLES, 0, 3);
+            gl.deleteFramebuffer(fb);
+            break;
+        }
+        case 'readpixels_oob': {
+            // readPixels with dimensions exceeding framebuffer
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 16, 16, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+            const fb = gl.createFramebuffer();
+            gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+            gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+
+            const bigW = randInt(1024, 65536);
+            const bigH = randInt(1024, 65536);
+            const buf = new Uint8Array(bigW * 4); // intentionally small
+            addLog(`readPixels ${bigW}x${bigH} from 16x16 FBO`, 'info');
+            try { gl.readPixels(0, 0, bigW, bigH, gl.RGBA, gl.UNSIGNED_BYTE, buf); } catch(e) { addLog(`Exception: ${e.message}`, 'err'); }
+            gl.deleteFramebuffer(fb);
+            break;
+        }
+    }
+
+    drainErrors(gl);
+    gl.deleteTexture(tex);
+}
+
+// Shader fuzzing
+function fuzzShader(gl) {
+    const strategies = [
+        'infinite_loop',
+        'huge_array',
+        'deep_nesting',
+        'type_mismatch',
+        'undefined_func',
+        'preprocessor_bomb',
+        'long_identifier',
+        'null_bytes',
+        'out_of_bounds_index',
+        'precision_abuse',
+    ];
+    const strategy = strategies[randInt(0, strategies.length)];
+
+    let vertSrc = 'attribute vec4 a;void main(){gl_Position=a;}';
+    let fragSrc;
+
+    switch (strategy) {
+        case 'infinite_loop':
+            fragSrc = 'precision mediump float;void main(){for(int i=0;i<2147483647;i++){gl_FragColor+=vec4(0.001);}gl_FragColor=vec4(1);}';
+            break;
+        case 'huge_array':
+            fragSrc = `precision mediump float;void main(){float a[${randInt(10000, 1000000)}];a[0]=1.0;gl_FragColor=vec4(a[0]);}`;
+            break;
+        case 'deep_nesting': {
+            let code = 'precision mediump float;void main(){float x=1.0;';
+            const depth = randInt(50, 500);
+            for (let i = 0; i < depth; i++) code += `if(x>0.0){x=x*0.99;`;
+            code += 'gl_FragColor=vec4(x);';
+            for (let i = 0; i < depth; i++) code += '}';
+            code += '}';
+            fragSrc = code;
+            break;
+        }
+        case 'type_mismatch':
+            fragSrc = 'precision mediump float;void main(){int x=1.0;gl_FragColor=vec4(x);}';
+            break;
+        case 'undefined_func':
+            fragSrc = 'precision mediump float;void main(){gl_FragColor=nonexistent(1.0);}';
+            break;
+        case 'preprocessor_bomb': {
+            let defines = '';
+            for (let i = 0; i < 1000; i++) defines += `#define M${i} ${i}\n`;
+            fragSrc = defines + 'precision mediump float;void main(){gl_FragColor=vec4(1);}';
+            break;
+        }
+        case 'long_identifier': {
+            const name = 'x'.repeat(randInt(1000, 100000));
+            fragSrc = `precision mediump float;float ${name}=1.0;void main(){gl_FragColor=vec4(${name});}`;
+            break;
+        }
+        case 'null_bytes':
+            fragSrc = 'precision mediump float;void main(){\x00\x00gl_FragColor=vec4(\x001.0\x00);}';
+            break;
+        case 'out_of_bounds_index':
+            fragSrc = 'precision mediump float;void main(){vec4 v=vec4(1);gl_FragColor=vec4(v[4],v[-1],v[2147483647],1);}';
+            break;
+        case 'precision_abuse':
+            fragSrc = 'precision lowp float;precision highp float;precision mediump float;void main(){gl_FragColor=vec4(1);}';
+            break;
+    }
+
+    addLog(`shader/${strategy}: ${fragSrc.length} chars`, 'info');
+
+    const vs = gl.createShader(gl.VERTEX_SHADER);
+    gl.shaderSource(vs, vertSrc);
+    gl.compileShader(vs);
+
+    const fs = gl.createShader(gl.FRAGMENT_SHADER);
+    gl.shaderSource(fs, fragSrc);
+    gl.compileShader(fs);
+
+    if (!gl.getShaderParameter(fs, gl.COMPILE_STATUS)) {
+        addLog(`Compile error (expected for some): ${gl.getShaderInfoLog(fs).substring(0, 100)}`, 'info');
+    } else {
+        const prog = gl.createProgram();
+        gl.attachShader(prog, vs);
+        gl.attachShader(prog, fs);
+        gl.linkProgram(prog);
+
+        if (gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+            gl.useProgram(prog);
+            gl.drawArrays(gl.TRIANGLES, 0, 3);
+            addLog('Shader compiled and drew!', 'warn');
+        }
+        gl.deleteProgram(prog);
+    }
+
+    gl.deleteShader(vs);
+    gl.deleteShader(fs);
+    drainErrors(gl);
+}
+
+// Framebuffer fuzzing
+function fuzzFramebuffer(gl) {
+    const strategies = [
+        'mismatched_sizes',
+        'too_many_attachments',
+        'recursive_fbo',
+        'delete_while_bound',
+        'draw_incomplete',
+        'render_to_self',
+    ];
+    const strategy = strategies[randInt(0, strategies.length)];
+
+    switch (strategy) {
+        case 'mismatched_sizes': {
+            const fb = gl.createFramebuffer();
+            gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+            const t1 = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, t1);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 64, 64, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+            gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t1, 0);
+
+            const rb = gl.createRenderbuffer();
+            gl.bindRenderbuffer(gl.RENDERBUFFER, rb);
+            gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16, 128, 128); // different size
+            gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, rb);
+
+            addLog('FBO mismatched attachment sizes 64 vs 128', 'info');
+            gl.drawArrays(gl.TRIANGLES, 0, 3);
+            gl.deleteTexture(t1);
+            gl.deleteRenderbuffer(rb);
+            gl.deleteFramebuffer(fb);
+            break;
+        }
+        case 'delete_while_bound': {
+            const fb = gl.createFramebuffer();
+            gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+            const t = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, t);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 32, 32, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+            gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
+
+            addLog('Delete texture while attached to FBO', 'info');
+            gl.deleteTexture(t); // delete backing while FBO references it
+            gl.drawArrays(gl.TRIANGLES, 0, 3); // use-after-free potential
+
+            const px = new Uint8Array(4);
+            try { gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px); } catch(e) {}
+            gl.deleteFramebuffer(fb);
+            break;
+        }
+        case 'draw_incomplete': {
+            const fb = gl.createFramebuffer();
+            gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+            // No attachments at all
+            addLog('Draw to FBO with no attachments', 'info');
+            gl.drawArrays(gl.TRIANGLES, 0, 3);
+            gl.deleteFramebuffer(fb);
+            break;
+        }
+        case 'render_to_self': {
+            const t = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, t);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 32, 32, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+
+            const fb = gl.createFramebuffer();
+            gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+            gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
+
+            // Now try to read from the same texture we're rendering to
+            gl.bindTexture(gl.TEXTURE_2D, t);
+            addLog('Render-to-self: same texture as FBO and sampler', 'info');
+            gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+            gl.deleteTexture(t);
+            gl.deleteFramebuffer(fb);
+            break;
+        }
+        default: {
+            addLog(`FBO/${strategy}`, 'info');
+            break;
+        }
+    }
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    drainErrors(gl);
+}
+
+async function fuzzOnce(mode) {
+    iterations++;
+    updateStats();
+
+    const gl = getGL();
+    if (!gl) { stopFuzz(); return; }
+
+    try {
+        if (mode === 'texture' || (mode === 'all' && Math.random() < 0.4)) {
+            fuzzTexture(gl);
+        } else if (mode === 'shader' || (mode === 'all' && Math.random() < 0.7)) {
+            fuzzShader(gl);
+        } else {
+            fuzzFramebuffer(gl);
+        }
+    } catch (e) {
+        crashes++;
+        addLog(`UNCAUGHT: ${e.name}: ${e.message}`, 'err');
+    }
+}
+
+async function startFuzz(mode) {
+    if (running) return;
+    running = true;
+    addLog(`=== Starting WebGL fuzzing (mode: ${mode}) ===`, 'ok');
+
+    while (running) {
+        await fuzzOnce(mode);
+        await new Promise(r => setTimeout(r, 20));
+    }
+}
+
+function stopFuzz() {
+    running = false;
+    addLog('=== Stopped ===', 'warn');
+}
+</script>
+</body>
+</html>

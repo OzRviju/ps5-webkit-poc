@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EME/CDM Fuzzer - PS5 WebKit</title>
+<style>
+body { background: #0a0a0a; color: #e0e0e0; font-family: system-ui, sans-serif; padding: 20px; max-width: 700px; margin: 0 auto; }
+h1 { color: #ff6600; font-size: 1.3em; }
+button { background: #ff6600; color: #fff; border: none; padding: 14px 20px; border-radius: 6px; font-size: 1em; margin: 6px 4px; cursor: pointer; }
+button:active { background: #cc5200; }
+button.stop { background: #cc0000; }
+#log { background: #111; padding: 12px; border-radius: 6px; font-family: monospace; font-size: 0.85em; max-height: 50vh; overflow-y: auto; white-space: pre-wrap; word-break: break-all; margin-top: 10px; }
+.err { color: #ff4444; }
+.ok { color: #00ff88; }
+.info { color: #888; }
+.warn { color: #ffaa00; }
+#stats { color: #00ccff; font-size: 0.9em; margin: 8px 0; }
+</style>
+</head>
+<body>
+<h1>EME/CDM Fuzzer</h1>
+<p style="color:#888;">Targets: PSCDMSessionBackend via requestLicense/updateLicense with malformed init data and license responses.<br>
+Monitors klog per SIGSEGV/SIGBUS nel demuxer CDM Sony.</p>
+
+<div>
+<button onclick="startFuzz('cenc')">Fuzz CENC</button>
+<button onclick="startFuzz('keyids')">Fuzz KeyIDs</button>
+<button onclick="startFuzz('webm')">Fuzz WebM</button>
+<button onclick="startFuzz('all')">Fuzz All</button>
+<button class="stop" onclick="stopFuzz()">Stop</button>
+</div>
+<div id="stats">Iterations: 0 | Errors: 0 | CDM Errors: 0</div>
+<div id="log"></div>
+
+<script>
+const log = document.getElementById('log');
+const statsEl = document.getElementById('stats');
+let running = false;
+let iterations = 0;
+let errors = 0;
+let cdmErrors = 0;
+let timerId = null;
+
+function addLog(msg, cls) {
+    const line = document.createElement('div');
+    line.className = cls || '';
+    line.textContent = `[${iterations}] ${msg}`;
+    log.appendChild(line);
+    if (log.children.length > 500) log.removeChild(log.firstChild);
+    log.scrollTop = log.scrollHeight;
+}
+
+function updateStats() {
+    statsEl.textContent = `Iterations: ${iterations} | Errors: ${errors} | CDM Errors: ${cdmErrors}`;
+}
+
+function randInt(min, max) { return min + Math.floor(Math.random() * (max - min)); }
+function randBytes(len) {
+    const arr = new Uint8Array(len);
+    crypto.getRandomValues(arr);
+    return arr;
+}
+
+// Generate CENC init data (PSSH box format)
+function genCENCInitData(strategy) {
+    // PSSH box: [size:4][type:4='pssh'][version:1][flags:3][systemID:16][dataSize:4][data:N]
+    const systemID = new Uint8Array([
+        0x10,0x77,0xEF,0xEC,0xC0,0xB2,0x4D,0x02,
+        0xAC,0xE3,0x3C,0x1E,0x52,0xE2,0xFB,0x4B
+    ]); // Clearkey system ID
+
+    let data;
+    switch (strategy) {
+        case 'empty':
+            data = new Uint8Array(0);
+            break;
+        case 'huge_size':
+            data = randBytes(4);
+            // Forge a PSSH with dataSize = 0xFFFFFFFF
+            const pssh = new Uint8Array(32 + 4);
+            pssh.set([0x00,0x00,0x00,0x24], 0); // box size = 36
+            pssh.set([0x70,0x73,0x73,0x68], 4); // 'pssh'
+            pssh[8] = 0x00; // version
+            pssh.set([0x00,0x00,0x00], 9); // flags
+            pssh.set(systemID, 12);
+            pssh.set([0xFF,0xFF,0xFF,0xFF], 28); // dataSize overflow
+            pssh.set(data, 32);
+            return pssh.buffer;
+        case 'negative_size':
+            return makePSSH(systemID, randBytes(16), 0x80000000);
+        case 'zero_size':
+            return makePSSH(systemID, new Uint8Array(0), 0);
+        case 'truncated':
+            data = randBytes(randInt(1, 15)); // truncated mid-header
+            return data.buffer;
+        case 'garbage':
+            return randBytes(randInt(32, 4096)).buffer;
+        case 'nested_pssh':
+            // PSSH containing another PSSH as data
+            const inner = new Uint8Array(makePSSH(systemID, randBytes(16)));
+            return makePSSH(systemID, inner);
+        case 'large_kidcount': {
+            // Version 1 PSSH with huge KID count
+            const buf = new Uint8Array(32 + 4 + 4);
+            buf.set([0x00,0x00,0x00,0x28], 0);
+            buf.set([0x70,0x73,0x73,0x68], 4);
+            buf[8] = 0x01; // version 1
+            buf.set([0x00,0x00,0x00], 9);
+            buf.set(systemID, 12);
+            // KID count = 0xFFFFFFFF
+            buf.set([0xFF,0xFF,0xFF,0xFF], 28);
+            buf.set([0x00,0x00,0x00,0x00], 32); // dataSize = 0
+            return buf.buffer;
+        }
+        default:
+            data = randBytes(randInt(16, 256));
+            return makePSSH(systemID, data);
+    }
+    return makePSSH(systemID, data);
+}
+
+function makePSSH(systemID, data, overrideDataSize) {
+    const dataLen = overrideDataSize !== undefined ? overrideDataSize : data.length;
+    const totalLen = 32 + data.length;
+    const buf = new Uint8Array(totalLen);
+    // Box size
+    buf[0] = (totalLen >> 24) & 0xFF;
+    buf[1] = (totalLen >> 16) & 0xFF;
+    buf[2] = (totalLen >> 8) & 0xFF;
+    buf[3] = totalLen & 0xFF;
+    // 'pssh'
+    buf.set([0x70,0x73,0x73,0x68], 4);
+    buf[8] = 0x00; // version
+    buf.set([0x00,0x00,0x00], 9);
+    buf.set(systemID, 12);
+    // dataSize (possibly overridden)
+    buf[28] = (dataLen >> 24) & 0xFF;
+    buf[29] = (dataLen >> 16) & 0xFF;
+    buf[30] = (dataLen >> 8) & 0xFF;
+    buf[31] = dataLen & 0xFF;
+    buf.set(data, 32);
+    return buf.buffer;
+}
+
+// Generate KeyIDs JSON init data
+function genKeyIDsInitData(strategy) {
+    let json;
+    switch (strategy) {
+        case 'empty_kids':
+            json = JSON.stringify({ kids: [] });
+            break;
+        case 'huge_kids':
+            json = JSON.stringify({ kids: Array(10000).fill('AAAAAAAAAAAAAAAAAAAAAA') });
+            break;
+        case 'invalid_b64':
+            json = JSON.stringify({ kids: ['!!!invalid!!!', '@@@@', '\x00\x00'] });
+            break;
+        case 'long_kid':
+            json = JSON.stringify({ kids: [btoa(String.fromCharCode(...randBytes(65536)))] });
+            break;
+        case 'malformed_json':
+            json = '{"kids":["aa"'; // unclosed
+            break;
+        case 'null_bytes':
+            json = '{"kids":["' + '\x00'.repeat(100) + '"]}';
+            break;
+        default:
+            json = JSON.stringify({ kids: [btoa(String.fromCharCode(...randBytes(16)))] });
+    }
+    return new TextEncoder().encode(json).buffer;
+}
+
+// Generate WebM init data
+function genWebMInitData(strategy) {
+    switch (strategy) {
+        case 'empty':
+            return new ArrayBuffer(0);
+        case 'single_kid':
+            return randBytes(16).buffer;
+        case 'oversized':
+            return randBytes(randInt(1024, 65536)).buffer;
+        case 'truncated':
+            return randBytes(randInt(1, 15)).buffer;
+        default:
+            return randBytes(16).buffer;
+    }
+}
+
+const cencStrategies = ['empty','huge_size','negative_size','zero_size','truncated','garbage','nested_pssh','large_kidcount','random'];
+const keyidStrategies = ['empty_kids','huge_kids','invalid_b64','long_kid','malformed_json','null_bytes','random'];
+const webmStrategies = ['empty','single_kid','oversized','truncated','random'];
+
+// Key systems to try
+const keySystems = [
+    'com.pssecure.widevine.alpha',
+    'com.widevine.alpha',
+    'com.pssecure.playready',
+    'com.microsoft.playready',
+    'org.w3.clearkey',
+    'com.pssecure.clearkey',
+];
+
+async function fuzzOnce(mode) {
+    iterations++;
+    updateStats();
+
+    let initDataType, initData, strategy;
+
+    if (mode === 'cenc' || (mode === 'all' && Math.random() < 0.4)) {
+        initDataType = 'cenc';
+        strategy = cencStrategies[randInt(0, cencStrategies.length)];
+        initData = genCENCInitData(strategy);
+    } else if (mode === 'keyids' || (mode === 'all' && Math.random() < 0.6)) {
+        initDataType = 'keyids';
+        strategy = keyidStrategies[randInt(0, keyidStrategies.length)];
+        initData = genKeyIDsInitData(strategy);
+    } else {
+        initDataType = 'webm';
+        strategy = webmStrategies[randInt(0, webmStrategies.length)];
+        initData = genWebMInitData(strategy);
+    }
+
+    const keySystem = keySystems[randInt(0, keySystems.length)];
+    addLog(`${initDataType}/${strategy} → ${keySystem} (${initData.byteLength}B)`, 'info');
+
+    try {
+        // Try requestMediaKeySystemAccess first
+        const access = await navigator.requestMediaKeySystemAccess(keySystem, [{
+            initDataTypes: [initDataType],
+            videoCapabilities: [{ contentType: 'video/mp4; codecs="avc1.42E01E"' }],
+            audioCapabilities: [{ contentType: 'audio/mp4; codecs="mp4a.40.2"' }],
+        }]);
+
+        addLog(`Got access for ${keySystem}`, 'ok');
+
+        const mediaKeys = await access.createMediaKeys();
+        addLog('Created MediaKeys', 'ok');
+
+        const session = mediaKeys.createSession('temporary');
+
+        session.addEventListener('message', (e) => {
+            addLog(`License request: ${e.messageType}, ${e.message.byteLength}B`, 'warn');
+            // Try to send garbage as license response
+            const garbageResponse = randBytes(randInt(16, 4096));
+            session.update(garbageResponse).then(() => {
+                addLog('Update accepted (unexpected!)', 'ok');
+            }).catch(err => {
+                cdmErrors++;
+                addLog(`Update rejected: ${err.name}`, 'info');
+            });
+        });
+
+        session.addEventListener('keystatuseschange', (e) => {
+            addLog(`Key status change: ${session.keyStatuses.size} keys`, 'warn');
+        });
+
+        // generateRequest triggers the CDM backend
+        await session.generateRequest(initDataType, initData);
+        addLog('generateRequest succeeded', 'ok');
+
+        // Wait a bit for async callbacks
+        await new Promise(r => setTimeout(r, 100));
+
+        // Close session
+        try { await session.close(); } catch(e) {}
+
+    } catch (err) {
+        errors++;
+        const msg = `${err.name}: ${err.message}`;
+        if (msg.includes('NotSupported') || msg.includes('not supported')) {
+            addLog(`Not supported: ${keySystem}`, 'info');
+        } else {
+            addLog(`ERROR: ${msg}`, 'err');
+        }
+    }
+}
+
+async function startFuzz(mode) {
+    if (running) return;
+    running = true;
+    addLog(`=== Starting EME/CDM fuzzing (mode: ${mode}) ===`, 'ok');
+
+    while (running) {
+        try {
+            await fuzzOnce(mode);
+        } catch (e) {
+            addLog(`Uncaught: ${e}`, 'err');
+        }
+        // Small delay to not lock up the browser
+        await new Promise(r => setTimeout(r, 50));
+    }
+}
+
+function stopFuzz() {
+    running = false;
+    addLog('=== Stopped ===', 'warn');
+}
+</script>
+</body>
+</html>
